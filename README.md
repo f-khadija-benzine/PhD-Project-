@@ -219,22 +219,33 @@ if __name__ == "__main__":
     verify_data_structure()
 ```
 
-## Usage in Data Loader
+## Data Loader Usage
 
-The unified data loader will automatically detect and load from these paths:
+### Phase 1: C-MAPSS and NASA Milling (Current Implementation)
 
+The multi-dataset loader currently supports C-MAPSS turbofan datasets and NASA Milling tool wear data, with automatic path detection from the configured directory structure.
+
+**Quick Start:**
 ```python
-from src.data_loader import UnifiedDataLoader
+from src.data_loader import MultiDatasetLoader
 
-# Initialize loader
-loader = UnifiedDataLoader()
+# Initialize loader (uses paths from src/config.py)
+loader = MultiDatasetLoader()
 
-# Load different datasets
-cmapss_data = loader.load_dataset('C_MAPSS', subset='FD001')
-pronostia_data = loader.load_dataset('PRONOSTIA', subset='Learning_set')
-ims_data = loader.load_dataset('IMS', subset='1st_test')
-battery_data = loader.load_dataset('NASA_BATTERY', subset='00005')
-milling_data = loader.load_dataset('NASA_MILLING')
+# Load individual C-MAPSS datasets
+fd001_data = loader.load_fd001()
+fd002_data = loader.load_fd002()
+
+# Or load all C-MAPSS datasets at once
+all_cmapss = loader.load_all_cmapss()
+
+# Load NASA Milling dataset
+milling_data = loader.load_nasa_milling()
+
+# Access train/test splits
+train_df = fd001_data['train']
+test_df = fd001_data['test']
+config = fd001_data['config']
 ```
 
 ## Storage Requirements
