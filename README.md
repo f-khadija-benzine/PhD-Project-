@@ -247,6 +247,13 @@ train_df = fd001_data['train']
 test_df = fd001_data['test']
 config = fd001_data['config']
 ```
+## Testing the Data Loader
+
+To test the data loader functionality, run the validation notebook located at:
+
+**`notebooks/data_loader_test.ipynb`**
+
+This notebook tests all loading functions, validates data integrity, and provides usage examples for both C-MAPSS and NASA Milling datasets.
 
 ## Storage Requirements
 
