@@ -16,11 +16,17 @@ warnings.filterwarnings('ignore')
 import sys
 from pathlib import Path
 
-# Add project root (one level up from "docs")
-ROOT = Path(__file__).resolve().parents[2] if "__file__" in globals() else Path().resolve().parents[1]
-sys.path.append(str(ROOT))
+# Add project root
+current_file = Path(__file__).resolve()
+src_dir = current_file.parent
+project_root = src_dir.parent
 
-from src.config import RAW_DATA_DIR, C_MAPSS_DIR, IMS_DIR, NASA_BATTERY_DIR, NASA_MILLING_DIR, PRONOSTIA_DIR
+# Add both src and project root to path
+sys.path.insert(0, str(src_dir))
+sys.path.insert(0, str(project_root))
+
+# Import config (now that paths are set up)
+from config import RAW_DATA_DIR, C_MAPSS_DIR, IMS_DIR, NASA_BATTERY_DIR, NASA_MILLING_DIR, PRONOSTIA_DIR
 
 class DatasetConfig:
     """Configuration class for different datasets"""
@@ -56,19 +62,19 @@ class DatasetConfig:
     }
 
     FD003 = {
-            'name': 'FD003',
-            'type': 'turbofan', 
-            'description': 'Single operating condition, multiple fault modes (HPC & Fan degradation)',
-            'file_format': 'txt',
-            'separator': ' ',
-            'columns': ['unit', 'cycle'] + [f'setting_{i}' for i in range(1, 4)] + 
-                      [f'sensor_{i}' for i in range(1, 22)],
-            'target_col': 'rul',
-            'unit_col': 'unit',
-            'cycle_col': 'cycle', 
-            'operating_conditions': 1,
-            'fault_modes': 2
-        }
+        'name': 'FD003',
+        'type': 'turbofan',
+        'description': 'Single operating condition, multiple fault modes (HPC & Fan degradation)',
+        'file_format': 'txt',
+        'separator': ' ',
+        'columns': ['unit', 'cycle'] + [f'setting_{i}' for i in range(1, 4)] +
+                  [f'sensor_{i}' for i in range(1, 22)],
+        'target_col': 'rul',
+        'unit_col': 'unit',
+        'cycle_col': 'cycle',
+        'operating_conditions': 1,
+        'fault_modes': 2
+    }
     FD004 = {
         'name': 'FD004',
         'type': 'turbofan',
@@ -287,8 +293,8 @@ class MultiDatasetLoader:
         
         # Split back into train and test
         train_size = len(train_df)
-        train_df['operating_condition'] = all_data['operating_condition'][:train_size].values
-        test_df['operating_condition'] = all_data['operating_condition'][train_size:].values
+        train_df['operating_condition'] = all_data['operating_condition'].iloc[:train_size].values
+        test_df['operating_condition'] = all_data['operating_condition'].iloc[train_size:].values
         
         # Create operating condition summary
         op_conditions = {
@@ -301,19 +307,22 @@ class MultiDatasetLoader:
         
         return op_conditions
 
-    def load_nasa_milling(self, dataset_path: str = "NASA_Milling") -> Dict:
+    def load_nasa_milling(self, dataset_path: Path = None) -> Dict:
         """
         Load NASA Milling dataset for tool wear prediction
-        
+
         Args:
-            dataset_path: Path to the NASA Milling dataset folder
-            
+            dataset_path: Path to the NASA Milling dataset folder (defaults to NASA_MILLING_DIR from config)
+
         Returns:
             Dict with processed milling data
         """
+        if dataset_path is None:
+            dataset_path = NASA_MILLING_DIR
+
         config = DatasetConfig.NASA_MILLING
-        
-        dataset_dir = self.data_root / dataset_path
+
+        dataset_dir = Path(dataset_path)
         if not dataset_dir.exists():
             raise FileNotFoundError(f"NASA Milling dataset directory not found: {dataset_dir}")
         
@@ -557,7 +566,47 @@ class MultiDatasetLoader:
                 validation_report['is_valid'] = False
         
         return validation_report
-         
+
+    def debug_dataset_files(self, dataset_name: str) -> Dict:
+        """
+        Debug helper to check file existence and basic structure for a dataset
+
+        Args:
+            dataset_name: Name of the dataset to debug
+
+        Returns:
+            Dict with file existence and basic stats
+        """
+        config = getattr(DatasetConfig, dataset_name)
+        files_exist = {'train': False, 'test': False, 'rul': False}
+        debug_info = {'files_exist': files_exist}
+
+        # Check file existence
+        train_file = self.data_root / "C_MAPSS" / f"train_{dataset_name}.txt"
+        test_file = self.data_root / "C_MAPSS" / f"test_{dataset_name}.txt"
+        rul_file = self.data_root / "C_MAPSS" / f"RUL_{dataset_name}.txt"
+
+        files_exist['train'] = train_file.exists()
+        files_exist['test'] = test_file.exists()
+        files_exist['rul'] = rul_file.exists()
+
+        # Try to get basic info if files exist
+        if files_exist['test']:
+            try:
+                test_df = pd.read_csv(test_file, sep=r'\s+', header=None, engine='python')
+                debug_info['estimated_test_units'] = test_df[0].nunique()  # unit column
+            except Exception:
+                debug_info['estimated_test_units'] = 'error reading file'
+
+        if files_exist['rul']:
+            try:
+                rul_df = pd.read_csv(rul_file, sep=r'\s+', header=None, engine='python')
+                debug_info['rul_values'] = len(rul_df)
+            except Exception:
+                debug_info['rul_values'] = 'error reading file'
+
+        return debug_info
+
     def get_dataset_summary(self) -> Dict:
         """
         Get summary of all loaded datasets
