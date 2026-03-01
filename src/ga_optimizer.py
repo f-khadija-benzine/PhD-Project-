@@ -33,8 +33,8 @@ ML_SEARCH_SPACE = {
     'colsample_bytree':   [0.6, 0.7, 0.8, 0.9, 1.0],
     'reg_alpha':          [0.0, 0.01, 0.1, 1.0],
     'reg_lambda':         [0.1, 0.5, 1.0, 2.0],
-    'flatten_strategy':   ['statistics', 'flatten'],
-    'feature_selection':  ['correlation', 'aficv', 'sensor_only'],
+    'flatten_strategy':   ['statistics'],
+    'feature_selection':  ['correlation', 'aficv'],
 }
 
 DL_SEARCH_SPACE = {
@@ -45,7 +45,7 @@ DL_SEARCH_SPACE = {
     'dense_units':             [16, 32, 64],
     'learning_rate':           [0.0001, 0.0005, 0.001, 0.005],
     'batch_size':              [64, 128, 256],
-    'feature_selection':       ['correlation', 'aficv', 'sensor_only'],
+    'feature_selection':       ['correlation', 'aficv'],
 }
 
 
