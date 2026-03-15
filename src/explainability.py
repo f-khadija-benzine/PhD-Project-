@@ -137,12 +137,17 @@ def analyze_attention_temporal(attn_model, X_test: np.ndarray,
     
     # outputs depends on model structure
     # Typically: [prediction, feature_weights, temporal_weights]
-    if isinstance(outputs, list) and len(outputs) >= 3:
-        feature_weights = outputs[1]  # (n_samples, n_features)
-        temporal_weights = outputs[2]  # (n_samples, window_size)
-    else:
-        raise ValueError(f"Unexpected attention model output: {type(outputs)}, len={len(outputs) if isinstance(outputs, list) else 'N/A'}")
+    # Get attention weights
+    outputs = attn_model.predict(X_test, batch_size=256, verbose=0)
     
+    if isinstance(outputs, dict):
+        feature_weights = outputs['feature_weights']
+        temporal_weights = outputs['temporal_weights']
+    elif isinstance(outputs, list) and len(outputs) >= 3:
+        feature_weights = outputs[1]
+        temporal_weights = outputs[2]
+    else:
+        raise ValueError(f"Unexpected attention model output: {type(outputs)}")
     result = {
         'feature_weights': feature_weights,
         'temporal_weights': temporal_weights,
