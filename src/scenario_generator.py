@@ -52,17 +52,24 @@ class UnitContext:
     current_cycle: int
     predicted_rul: float
     
-    # BI indicators
+    # BI indicators — costs
     pm_cost: float = 0.0
     cm_cost: float = 0.0
     downtime_penalty: float = 0.0     # cost per hour of downtime
     revenue_per_hour: float = 0.0
+    
+    # BI indicators — resources
     technician_available: int = 1
     spare_parts_available: int = 1
     spare_parts_lead_time: float = 0.0
     labor_rate_standard: float = 0.0
     labor_rate_overtime: float = 0.0
     contract_penalty_active: int = 0
+    
+    # BI indicators — operational context
+    production_priority: int = 1      # 0=low, 1=medium, 2=high
+    maintenance_window: int = 1       # 1=window available, 0=not available
+    shift_pattern: int = 0            # 0=day, 1=evening, 2=night
     
     @property
     def eol(self) -> int:
@@ -75,6 +82,26 @@ class UnitContext:
         if self.pm_cost > 0:
             return self.cm_cost / self.pm_cost
         return 5.0  # default
+    
+    @property
+    def priority_multiplier(self) -> float:
+        """Cost multiplier based on production priority."""
+        # High priority → downtime costs more
+        return {0: 0.7, 1: 1.0, 2: 1.5}[self.production_priority]
+    
+    @property
+    def priority_label(self) -> str:
+        return {0: 'Low', 1: 'Medium', 2: 'High'}[self.production_priority]
+    
+    @property
+    def shift_label(self) -> str:
+        return {0: 'Day', 1: 'Evening', 2: 'Night'}[self.shift_pattern]
+    
+    @property
+    def shift_labor_multiplier(self) -> float:
+        """Labor cost multiplier based on shift pattern."""
+        # Night shift → more expensive
+        return {0: 1.0, 1: 1.15, 2: 1.3}[self.shift_pattern]
 
 
 # ==============================================================================
@@ -150,13 +177,13 @@ class ScenarioGenerator:
     
     def _do_nothing_scenario(self, ctx: UnitContext) -> MaintenanceScenario:
         """Baseline: operate until failure, then corrective maintenance."""
-        # Costs
-        intervention_cost = ctx.cm_cost
-        downtime_cost = ctx.downtime_penalty * self.cm_downtime_hours
+        # Costs — adjusted by production priority and shift
+        intervention_cost = ctx.cm_cost * ctx.shift_labor_multiplier
+        downtime_cost = ctx.downtime_penalty * self.cm_downtime_hours * ctx.priority_multiplier
         
         # Production loss: degraded performance over remaining life
-        # Modeled as linearly increasing cost
-        production_loss = ctx.revenue_per_hour * ctx.predicted_rul * 0.1  # 10% avg degradation
+        # Higher priority → more revenue lost per cycle
+        production_loss = ctx.revenue_per_hour * ctx.predicted_rul * 0.1 * ctx.priority_multiplier
         
         total = intervention_cost + downtime_cost + production_loss
         
@@ -191,8 +218,16 @@ class ScenarioGenerator:
         else:
             label = f'PM Late (t={t_pm}, η={eta})'
         
-        # Costs
+        # --- Intervention cost ---
         intervention_cost = ctx.pm_cost
+        
+        # Shift pattern: night/evening → higher labor cost
+        intervention_cost *= ctx.shift_labor_multiplier
+        
+        # No maintenance window → must use overtime
+        if not ctx.maintenance_window:
+            intervention_cost += ctx.labor_rate_overtime * self.pm_downtime_hours
+            label += ' [no window]'
         
         # Overtime if no technician available
         if not ctx.technician_available:
@@ -202,23 +237,27 @@ class ScenarioGenerator:
         if not ctx.spare_parts_available:
             intervention_cost += ctx.spare_parts_lead_time * ctx.labor_rate_standard
         
-        downtime_cost = ctx.downtime_penalty * self.pm_downtime_hours
-        
-        # Production loss: degraded performance until PM
-        production_loss = ctx.revenue_per_hour * cycles_until_pm * 0.05  # 5% avg before PM
-        
         # Contract penalty if active
         if ctx.contract_penalty_active:
             intervention_cost *= 1.2  # 20% surcharge
         
+        # --- Downtime cost — adjusted by production priority ---
+        downtime_cost = ctx.downtime_penalty * self.pm_downtime_hours * ctx.priority_multiplier
+        
+        # --- Production loss until PM — higher priority = more revenue at risk ---
+        production_loss = ctx.revenue_per_hour * cycles_until_pm * 0.05 * ctx.priority_multiplier
+        
         total = intervention_cost + downtime_cost + production_loss
         
-        # Risk: probability of failure before PM
-        # Higher if PM is scheduled late
+        # --- Risk: probability of failure before PM ---
         if cycles_remaining > 0:
             p_failure = max(0.0, min(0.9, (fraction ** 2) * 0.8))
         else:
             p_failure = 0.95
+        
+        # High priority + late PM → extra risk penalty
+        if ctx.production_priority == 2 and fraction > 0.7:
+            p_failure = min(0.95, p_failure * 1.3)
         
         # RUL after PM
         rul_after = 125.0 - (1 - eta) * (125.0 - max(cycles_remaining - cycles_until_pm, 0))
@@ -270,24 +309,54 @@ def generate_recommendation(scenarios: List[MaintenanceScenario],
     savings = do_nothing.total_cost - best.total_cost
     risk_reduction = do_nothing.failure_probability - best.failure_probability
     
+    # Context summary
+    ctx_lines = []
+    ctx_lines.append(f"  Production priority: {context.priority_label}")
+    ctx_lines.append(f"  Maintenance window:  {'Available' if context.maintenance_window else 'NOT available (overtime required)'}")
+    ctx_lines.append(f"  Shift pattern:       {context.shift_label} (labor multiplier: {context.shift_labor_multiplier:.2f}x)")
+    ctx_lines.append(f"  Technician:          {'Available' if context.technician_available else 'NOT available'}")
+    ctx_lines.append(f"  Spare parts:         {'Available' if context.spare_parts_available else f'NOT available (lead time: {context.spare_parts_lead_time:.0f}h)'}")
+    ctx_summary = '\n'.join(ctx_lines)
+    
     if best.action == 'do_nothing':
         rec = (f"RECOMMENDATION for Unit {context.unit_id}:\n"
                f"  Action: Continue monitoring\n"
                f"  Predicted RUL: {context.predicted_rul:.0f} cycles\n"
                f"  Failure risk: {best.failure_probability:.1%}\n"
                f"  Reason: No preventive action is cost-effective at this time.\n"
-               f"  Next review: in {max(int(context.predicted_rul * 0.3), 5)} cycles")
+               f"  Next review: in {max(int(context.predicted_rul * 0.3), 5)} cycles\n"
+               f"\n  --- Operational Context ---\n{ctx_summary}")
     else:
         rec = (f"RECOMMENDATION for Unit {context.unit_id}:\n"
                f"  Action: {best.name}\n"
                f"  Schedule maintenance at cycle {best.intervention_time}\n"
                f"  Restoration level: {best.restoration_level:.0%}\n"
-               f"  Expected cost: ${best.total_cost:,.0f}\n"
-               f"  Cost savings vs. failure: ${savings:,.0f} "
+               f"\n  --- Cost Analysis ---\n"
+               f"  Expected cost:         ${best.total_cost:,.0f}\n"
+               f"    Intervention:        ${best.intervention_cost:,.0f}\n"
+               f"    Downtime:            ${best.downtime_cost:,.0f}\n"
+               f"    Production loss:     ${best.production_loss_cost:,.0f}\n"
+               f"  Cost vs. failure:      ${savings:,.0f} saved "
                f"({savings/max(do_nothing.total_cost,1)*100:.0f}%)\n"
-               f"  Risk reduction: {risk_reduction:.1%}\n"
+               f"  Risk reduction:        {risk_reduction:.1%}\n"
                f"  RUL after maintenance: {best.rul_after_pm:.0f} cycles\n"
-               f"  Predicted RUL without action: {context.predicted_rul:.0f} cycles")
+               f"\n  --- Operational Context ---\n{ctx_summary}")
+        
+        # Warnings
+        warnings = []
+        if context.production_priority == 2:
+            warnings.append("⚠ HIGH PRIORITY unit — downtime costs are elevated")
+        if not context.maintenance_window:
+            warnings.append("⚠ No maintenance window — overtime rates apply")
+        if not context.technician_available:
+            warnings.append("⚠ Technician not available — scheduling required")
+        if not context.spare_parts_available:
+            warnings.append(f"⚠ Spare parts not available — {context.spare_parts_lead_time:.0f}h lead time")
+        if context.contract_penalty_active:
+            warnings.append("⚠ Contract penalty active — 20% surcharge on intervention")
+        
+        if warnings:
+            rec += "\n\n  --- Warnings ---\n  " + "\n  ".join(warnings)
     
     return rec
 
