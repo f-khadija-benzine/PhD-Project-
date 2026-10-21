@@ -1,112 +1,78 @@
 """
 Synthetic BI Data Generator for C-MAPSS Datasets (FD001-FD004)
 ==============================================================
-Generates realistic Business Intelligence data aligned with turbofan engine
-sensor data for the proposed framework's BI fusion pipeline.
+Generates realistic Business Intelligence data ALIGNED with the actual
+C-MAPSS turbofan sensor data — reads real train/test files to match exact
+(unit_id, cycle) pairs.
 
-Design Principles:
-- Multi-Δ update frequencies (realistic enterprise system refresh rates)
-- BI variables reflect OPERATIONAL CONTEXT (costs, schedule, resources),
-  NOT degradation state — no variable is a function of RUL or health index
-- Realistic aerospace MRO (Maintenance, Repair, Overhaul) economics
-- Consistent with Section III-B3 of the paper (temporal alignment, encoding)
+Run from your project root:
+    python src/generate_bi_data.py
 
-Key design decision (v2 — Oct 2026):
-  Previous version computed downtime_penalty and production_priority as
-  functions of a health_index = 1 - cycle/max_cycle, which is literally
-  normalized RUL. This created near-perfect correlation (ρ ≈ -0.985) with
-  RUL, making those variables proxies rather than contextual features.
+Requires:
+    - C-MAPSS files in data/raw_data/C_MAPSS/{train,test}_FD00X.txt
+    - Output goes to data/raw_data/BI_data/BI_FD00X_{train,test}.csv
 
-  In the revised version:
-  - downtime_penalty depends on production_priority, shift, contract status,
-    and market noise — factors an ERP system would realistically report
-  - production_priority depends on a per-unit criticality class (fixed for
-    the engine's life) plus stochastic schedule variation
-  - No variable uses cycle, max_cycle, or any degradation-derived quantity
+Design Principles (v2 — leakage-free):
+    - Multi-Delta_k update frequencies (realistic enterprise system refresh)
+    - NO BI variable is a function of degradation, lifetime, or RUL.
+      BI describes the OPERATIONAL and ECONOMIC CONTEXT the engine runs in:
+        * production_priority: driven by a per-unit criticality class
+          (fleet role, fixed for the engine's life) + schedule fluctuation
+        * downtime_penalty: driven by priority x shift x contract x market
+        * pm_cost, cm_cost, labor rates: contract/market-driven,
+          mean-reverting (no time trend)
+        * revenue_per_hour: seasonal with an ABSOLUTE period and a random
+          per-unit phase (not scaled to each unit's lifetime)
+        * spare parts, technician, contract: stochastic, autocorrelated
+    - Test BI is generated ONLY for observed cycles; the ground-truth
+      RUL file is never read.
+    - Realistic aerospace MRO economics (CM/PM ratio: 5-10x)
+    - 1 cycle = 1 complete flight (~90 min) per Saxena et al. (2008)
 
-Reference costs based on real aerospace MRO industry data:
-- Turbofan engine PM (scheduled shop visit): $50,000 - $150,000
-- Turbofan engine CM (unplanned removal): $200,000 - $800,000
-- CM/PM ratio: typically 3x-8x in aerospace
-- Aircraft on ground (AOG) penalty: $10,000 - $150,000/hour
-- Engine shop visit duration: 40-90 days (PM), 60-120+ days (CM)
+Change log:
+    v1: production_priority and downtime_penalty were functions of
+        health_index = 1 - cycle/max_cycle (= normalized RUL), giving
+        within-unit rho(downtime_penalty, RUL) = -0.985. Test BI used
+        max_cycle = observed + true RUL, leaking test ground truth.
+    v2: all degradation/lifetime dependence removed (this file).
+
+Author: Fatima Khadija Benzine
 """
 
 import pandas as pd
 import numpy as np
-import os
+import sys
+from pathlib import Path
 
 np.random.seed(42)
 
-# ===========================================================================
-# C-MAPSS Dataset Specifications
-# ===========================================================================
-CMAPSS_SPECS = {
-    'FD001': {'n_train_units': 100, 'n_test_units': 100, 'op_conditions': 1, 'fault_modes': 1,
-              'avg_life': 206, 'min_life': 128, 'max_life': 362},
-    'FD002': {'n_train_units': 260, 'n_test_units': 259, 'op_conditions': 6, 'fault_modes': 1,
-              'avg_life': 206, 'min_life': 128, 'max_life': 378},
-    'FD003': {'n_train_units': 100, 'n_test_units': 100, 'op_conditions': 1, 'fault_modes': 2,
-              'avg_life': 247, 'min_life': 145, 'max_life': 525},
-    'FD004': {'n_train_units': 249, 'n_test_units': 248, 'op_conditions': 6, 'fault_modes': 2,
-              'avg_life': 246, 'min_life': 128, 'max_life': 543},
-}
 
-# ===========================================================================
-# BI Variable Definitions with Update Frequencies (Δ in cycles)
-# ===========================================================================
-# Based on Section III-B3 and BI Data Collection Guide
-BI_VARIABLES = {
-    # --- Cost Structure (updated infrequently, from ERP) ---
-    'pm_cost':              {'delta': 50, 'type': 'continuous', 'source': 'ERP'},
-    'cm_cost':              {'delta': 50, 'type': 'continuous', 'source': 'ERP'},
-    'labor_rate_standard':  {'delta': 50, 'type': 'continuous', 'source': 'ERP'},
-    'labor_rate_overtime':  {'delta': 50, 'type': 'continuous', 'source': 'ERP'},
-
-    # --- Production Economics (updated per shift ~ every 10 cycles) ---
-    'production_priority':  {'delta': 10, 'type': 'categorical', 'source': 'MES'},
-    'downtime_penalty':     {'delta': 10, 'type': 'continuous',  'source': 'MES'},
-    'revenue_per_hour':     {'delta': 25, 'type': 'continuous',  'source': 'ERP/Finance'},
-
-    # --- Resource Availability (updated daily ~ every 25 cycles) ---
-    'spare_parts_available':{'delta': 25, 'type': 'binary',      'source': 'ERP/Inventory'},
-    'spare_parts_lead_time':{'delta': 25, 'type': 'continuous',  'source': 'ERP/Inventory'},
-    'technician_available': {'delta': 25, 'type': 'binary',      'source': 'HR/Scheduling'},
-
-    # --- Operational Constraints ---
-    'maintenance_window':   {'delta': 10, 'type': 'binary',      'source': 'MES'},
-    'shift_pattern':        {'delta': 10, 'type': 'categorical', 'source': 'MES'},
-    'contract_penalty_active': {'delta': 25, 'type': 'binary',   'source': 'ERP/Contracts'},
-}
-
-# ===========================================================================
-# Realistic Aerospace MRO Cost Parameters
-# ===========================================================================
-# Base costs in thousands of USD — scaled to C-MAPSS simulation context
-# We use a scaled-down version to represent per-cycle operational costs
+# ============================================================================
+# Cost parameters per dataset (scaled for simulation)
+# ============================================================================
 COST_PARAMS = {
-    'FD001': {  # Single condition, single fault — standard fleet
-        'pm_cost_base': 500, 'pm_cost_std': 75,        # $/event (scaled)
-        'cm_cost_base': 3500, 'cm_cost_std': 500,      # $/event (scaled)
-        'downtime_base': 5000, 'downtime_high': 15000,  # $/hour
-        'revenue_base': 8000, 'revenue_std': 1000,       # $/hour
-        'labor_std': 85, 'labor_ot': 135,                # $/hour
+    'FD001': {  # 1 op condition, 1 fault mode — standard fleet
+        'pm_cost_base': 500, 'pm_cost_std': 75,
+        'cm_cost_base': 3500, 'cm_cost_std': 500,
+        'downtime_base': 5000, 'downtime_high': 15000,
+        'revenue_base': 8000, 'revenue_std': 1000,
+        'labor_std': 85, 'labor_ot': 135,
     },
-    'FD002': {  # 6 conditions — variable operating costs
+    'FD002': {  # 6 op conditions, 1 fault mode — variable costs
         'pm_cost_base': 600, 'pm_cost_std': 120,
         'cm_cost_base': 4200, 'cm_cost_std': 800,
         'downtime_base': 6000, 'downtime_high': 18000,
         'revenue_base': 9000, 'revenue_std': 1500,
         'labor_std': 90, 'labor_ot': 145,
     },
-    'FD003': {  # 2 fault modes — higher uncertainty in costs
+    'FD003': {  # 1 op condition, 2 fault modes — higher uncertainty
         'pm_cost_base': 550, 'pm_cost_std': 100,
         'cm_cost_base': 4000, 'cm_cost_std': 700,
         'downtime_base': 5500, 'downtime_high': 16000,
         'revenue_base': 8500, 'revenue_std': 1200,
         'labor_std': 88, 'labor_ot': 140,
     },
-    'FD004': {  # 6 conditions + 2 faults — most complex, highest costs
+    'FD004': {  # 6 op conditions + 2 faults — most complex
         'pm_cost_base': 650, 'pm_cost_std': 140,
         'cm_cost_base': 4800, 'cm_cost_std': 900,
         'downtime_base': 7000, 'downtime_high': 20000,
@@ -115,136 +81,174 @@ COST_PARAMS = {
     },
 }
 
-# ===========================================================================
-# Generator Functions
-# ===========================================================================
-
-def generate_unit_lifetime(specs):
-    """Generate realistic lifetimes for each unit based on dataset statistics."""
-    n_units = specs['n_train_units']
-    lifetimes = np.random.randint(specs['min_life'], specs['max_life'] + 1, size=n_units)
-    return lifetimes
+# Revenue seasonality: absolute period in cycles (~1 cycle = 1 flight),
+# identical for every unit, so it carries no lifetime information.
+REVENUE_PERIOD_CYCLES = 300
 
 
-def generate_pm_cost(n_periods, params):
-    """PM costs: independent of degradation, slight random walk (market fluctuations)."""
-    base = params['pm_cost_base']
-    std = params['pm_cost_std']
-    costs = [base + np.random.normal(0, std * 0.3)]
+# ============================================================================
+# Read real C-MAPSS observed lengths
+# ============================================================================
+
+def read_cmapss_lengths(cmapss_dir: Path, dataset_name: str):
+    """
+    Read C-MAPSS train and test files, return the last OBSERVED cycle per unit.
+
+    Train: last observed cycle = failure cycle (run-to-failure).
+    Test:  last observed cycle = truncation point. The RUL ground-truth file
+           is deliberately NOT read — BI must not depend on it.
+
+    Returns:
+        (train_lengths, test_lengths): dicts {unit_id: n_cycles}
+    """
+    cols = ['unit', 'cycle'] + [f'op_{i}' for i in range(1, 4)] + \
+           [f's_{i}' for i in range(1, 22)]
+
+    train_file = cmapss_dir / f"train_{dataset_name}.txt"
+    if not train_file.exists():
+        raise FileNotFoundError(
+            f"C-MAPSS train file not found: {train_file}\n"
+            f"Expected in: {cmapss_dir}"
+        )
+    train_df = pd.read_csv(train_file, sep=r'\s+', header=None, names=cols, engine='python')
+    train_lengths = train_df.groupby('unit')['cycle'].max().to_dict()
+    print(f"  Train: {len(train_lengths)} units, "
+          f"cycles [{min(train_lengths.values())}, {max(train_lengths.values())}]")
+
+    test_lengths = {}
+    test_file = cmapss_dir / f"test_{dataset_name}.txt"
+    if test_file.exists():
+        test_df = pd.read_csv(test_file, sep=r'\s+', header=None, names=cols, engine='python')
+        test_lengths = test_df.groupby('unit')['cycle'].max().to_dict()
+        print(f"  Test:  {len(test_lengths)} units, observed cycles "
+              f"[{min(test_lengths.values())}, {max(test_lengths.values())}]")
+    else:
+        print("  Test:  file not found, skipping test units")
+
+    return train_lengths, test_lengths
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def expand_to_cycles(values, delta, n_cycles):
+    """Expand BI values sampled at delta intervals to per-cycle (Eq. 4)."""
+    expanded = np.empty(n_cycles)
+    for t in range(n_cycles):
+        idx = min(t // delta, len(values) - 1)
+        expanded[t] = values[idx]
+    return expanded
+
+
+def resample_to_delta(values, src_delta, dst_delta, n_dst):
+    """Read a Delta=src series at the sampling points of a Delta=dst series."""
+    return np.array([
+        values[min((i * dst_delta) // src_delta, len(values) - 1)]
+        for i in range(n_dst)
+    ])
+
+
+# ============================================================================
+# BI variable generators — none takes cycle, lifetime, or RUL as input
+# ============================================================================
+
+# --- Contract / market-driven (Delta=50) ---
+
+def gen_pm_cost(n_periods, p):
+    """Mean-reverting around the contract price (Ornstein-Uhlenbeck style)."""
+    base, std = p['pm_cost_base'], p['pm_cost_std']
+    vals = [base + np.random.normal(0, std * 0.3)]
     for _ in range(1, n_periods):
-        drift = np.random.normal(0, std * 0.05)
-        costs.append(np.clip(costs[-1] + drift, base * 0.7, base * 1.4))
-    return np.array(costs).round(2)
+        nxt = vals[-1] + 0.3 * (base - vals[-1]) + np.random.normal(0, std * 0.15)
+        vals.append(np.clip(nxt, base * 0.7, base * 1.4))
+    return np.array(vals).round(2)
 
 
-def generate_cm_cost(n_periods, params):
-    """CM costs: independent, higher variance, occasional spikes (supply chain)."""
-    base = params['cm_cost_base']
-    std = params['cm_cost_std']
-    costs = [base + np.random.normal(0, std * 0.3)]
+def gen_cm_cost(n_periods, p):
+    """Mean-reverting with occasional supply-chain shocks that decay."""
+    base, std = p['cm_cost_base'], p['cm_cost_std']
+    vals = [base + np.random.normal(0, std * 0.3)]
     for _ in range(1, n_periods):
-        spike = np.random.choice([0, 1], p=[0.92, 0.08])
-        drift = np.random.normal(0, std * 0.08) + spike * np.random.uniform(500, 1500)
-        costs.append(np.clip(costs[-1] + drift, base * 0.6, base * 1.8))
-    return np.array(costs).round(2)
+        shock = np.random.choice([0, 1], p=[0.90, 0.10]) * np.random.uniform(500, 1500)
+        nxt = vals[-1] + 0.4 * (base - vals[-1]) + np.random.normal(0, std * 0.15) + shock
+        vals.append(np.clip(nxt, base * 0.6, base * 1.8))
+    return np.array(vals).round(2)
 
 
-def generate_production_priority(n_periods, unit_criticality):
-    """
-    Production priority driven by OPERATIONAL CONTEXT, not degradation.
-
-    Each engine has a fixed criticality class drawn at the start of its life
-    (representing its role in the fleet: test stand, revenue flight, military
-    mission, etc.).  Priority fluctuates stochastically within that class to
-    model schedule changes, demand surges, and re-routing.
-
-    Categories: Low=0, Medium=1, High=2
-    """
-    priorities = []
-    for _ in range(n_periods):
-        if unit_criticality >= 0.7:       # high-criticality engine
-            p = np.random.choice([0, 1, 2], p=[0.10, 0.30, 0.60])
-        elif unit_criticality >= 0.3:     # medium-criticality engine
-            p = np.random.choice([0, 1, 2], p=[0.30, 0.45, 0.25])
-        else:                             # low-criticality engine
-            p = np.random.choice([0, 1, 2], p=[0.55, 0.35, 0.10])
-        priorities.append(p)
-    return np.array(priorities)
+def gen_labor(n_periods, level, std):
+    return (np.full(n_periods, level) + np.random.normal(0, std, n_periods)).round(2)
 
 
-def generate_downtime_penalty(n_periods, params, production_priorities,
-                               shift_patterns, contract_flags):
-    """
-    Downtime penalty driven by OPERATIONAL CONTEXT, not degradation.
+# --- Finance (Delta=25) ---
 
-    In a real MRO operation, the cost of taking an engine offline depends on:
-    - Production priority: a high-priority line costs more when idled
-    - Shift pattern: day-shift downtime is more expensive (full staff, peak demand)
-    - Contract status: active delivery contracts raise penalty for delays
-    - Market/seasonal noise: demand fluctuations, fleet utilization rates
-
-    None of these factors depend on how degraded the engine is — they reflect
-    the operational and economic environment the engine operates in.
-    """
-    base = params['downtime_base']
-    high = params['downtime_high']
-    penalties = []
-
-    for i in range(n_periods):
-        # Priority multiplier: high-priority lines cost more when down
-        #   Low=0 → 1.0x, Medium=1 → 1.4x, High=2 → 1.8x
-        priority_mult = 1.0 + 0.4 * production_priorities[i]
-
-        # Shift multiplier: day shift (0) most costly, night (2) cheapest
-        shift_mult = {0: 1.15, 1: 0.90, 2: 0.75}.get(shift_patterns[i], 1.0)
-
-        # Contract penalty: active contracts raise downtime cost by ~25%
-        contract_mult = 1.25 if contract_flags[i] else 1.0
-
-        # Market/seasonal noise (±15%)
-        market_factor = np.random.normal(1.0, 0.15)
-        market_factor = np.clip(market_factor, 0.6, 1.5)
-
-        penalty = base * priority_mult * shift_mult * contract_mult * market_factor
-        penalties.append(np.clip(penalty, base * 0.3, high * 1.2))
-
-    return np.array(penalties).round(2)
-
-
-def generate_revenue_per_hour(n_periods, params):
-    """Revenue: independent, slight seasonal pattern."""
-    base = params['revenue_base']
-    std = params['revenue_std']
-    t = np.arange(n_periods)
-    seasonal = 0.1 * base * np.sin(2 * np.pi * t / max(n_periods, 1) * 2)
+def gen_revenue(n_periods, p, phase):
+    """Seasonal demand with an absolute period and a per-unit random phase."""
+    base, std = p['revenue_base'], p['revenue_std']
+    t_cycles = np.arange(n_periods) * 25
+    seasonal = 0.1 * base * np.sin(2 * np.pi * t_cycles / REVENUE_PERIOD_CYCLES + phase)
     noise = np.random.normal(0, std * 0.3, n_periods)
     return np.clip(base + seasonal + noise, base * 0.6, base * 1.5).round(2)
 
 
-def generate_spare_parts(n_periods):
-    """Spare parts availability: stochastic with autocorrelation."""
-    available = [np.random.choice([0, 1], p=[0.15, 0.85])]
+# --- Production context (Delta=10) ---
+
+def gen_production_priority(n_periods, unit_criticality):
+    """
+    Priority set by the engine's fleet role (criticality, fixed per unit)
+    plus schedule fluctuation. Independent of degradation.
+    Categories: Low=0, Medium=1, High=2
+    """
+    if unit_criticality >= 0.7:
+        probs = [0.10, 0.30, 0.60]
+    elif unit_criticality >= 0.3:
+        probs = [0.30, 0.45, 0.25]
+    else:
+        probs = [0.55, 0.35, 0.10]
+    return np.random.choice([0, 1, 2], size=n_periods, p=probs)
+
+
+def gen_downtime_penalty(n_periods, p, priority, shift, contract):
+    """
+    Cost of taking the engine offline, driven by operational context:
+      priority  Low/Med/High -> 1.0 / 1.4 / 1.8 x
+      shift     Day/Eve/Night -> 1.15 / 0.90 / 0.75 x
+      contract  active -> 1.25 x
+      market    ~N(1, 0.15), clipped to [0.6, 1.5]
+    """
+    base, high = p['downtime_base'], p['downtime_high']
+    shift_mult = {0: 1.15, 1: 0.90, 2: 0.75}
+    out = []
+    for i in range(n_periods):
+        mult = (1.0 + 0.4 * priority[i]) \
+               * shift_mult.get(int(shift[i]), 1.0) \
+               * (1.25 if contract[i] else 1.0) \
+               * np.clip(np.random.normal(1.0, 0.15), 0.6, 1.5)
+        out.append(np.clip(base * mult, base * 0.3, high * 1.2))
+    return np.array(out).round(2)
+
+
+# --- Resources (Delta=25, stochastic autocorrelated) ---
+
+def gen_spare_parts(n_periods):
+    avail = [np.random.choice([0, 1], p=[0.15, 0.85])]
     for _ in range(1, n_periods):
-        if available[-1] == 1:
-            available.append(np.random.choice([0, 1], p=[0.08, 0.92]))
+        if avail[-1] == 1:
+            avail.append(np.random.choice([0, 1], p=[0.08, 0.92]))
         else:
-            available.append(np.random.choice([0, 1], p=[0.40, 0.60]))
-    return np.array(available)
+            avail.append(np.random.choice([0, 1], p=[0.40, 0.60]))
+    return np.array(avail)
 
 
-def generate_lead_time(n_periods, parts_available):
-    """Lead time: depends on parts availability."""
-    lead_times = []
-    for avail in parts_available:
-        if avail == 1:
-            lead_times.append(np.random.choice([0, 1, 2], p=[0.6, 0.3, 0.1]))
-        else:
-            lead_times.append(np.random.choice([7, 14, 21, 30], p=[0.3, 0.35, 0.25, 0.1]))
-    return np.array(lead_times)
+def gen_lead_time(parts_avail):
+    return np.array([
+        np.random.choice([0, 1, 2], p=[0.6, 0.3, 0.1]) if a == 1
+        else np.random.choice([7, 14, 21, 30], p=[0.3, 0.35, 0.25, 0.1])
+        for a in parts_avail
+    ])
 
 
-def generate_technician_availability(n_periods):
-    """Technician availability: stochastic, slightly autocorrelated."""
+def gen_technician(n_periods):
     avail = [np.random.choice([0, 1], p=[0.10, 0.90])]
     for _ in range(1, n_periods):
         if avail[-1] == 1:
@@ -254,25 +258,7 @@ def generate_technician_availability(n_periods):
     return np.array(avail)
 
 
-def generate_maintenance_window(n_periods):
-    """Maintenance window: pattern-based (every 3rd period is a window)."""
-    pattern = []
-    for i in range(n_periods):
-        # ~30% of periods have a maintenance window (night shift, weekends)
-        if i % 3 == 0:
-            pattern.append(1)
-        else:
-            pattern.append(np.random.choice([0, 1], p=[0.85, 0.15]))
-    return np.array(pattern)
-
-
-def generate_shift_pattern(n_periods):
-    """Shift pattern: categorical cycling (Day=0, Evening=1, Night=2)."""
-    return np.array([i % 3 for i in range(n_periods)])
-
-
-def generate_contract_penalty(n_periods):
-    """Contract penalty active: stochastic, ~20% of time."""
+def gen_contract_penalty(n_periods):
     active = [np.random.choice([0, 1], p=[0.80, 0.20])]
     for _ in range(1, n_periods):
         if active[-1] == 1:
@@ -282,128 +268,150 @@ def generate_contract_penalty(n_periods):
     return np.array(active)
 
 
-def expand_bi_to_cycles(bi_values, delta, max_cycle):
-    """
-    Expand BI values (sampled at delta intervals) to per-cycle values.
-    Implements Eq. 4 from Section III-B3: b_k(t) = b_k^(p) for all t in [pΔ, (p+1)Δ)
-    """
-    expanded = np.empty(max_cycle)
-    for cycle in range(max_cycle):
-        period_idx = min(cycle // delta, len(bi_values) - 1)
-        expanded[cycle] = bi_values[period_idx]
-    return expanded
+# --- Operational patterns (Delta=10) ---
 
-
-def generate_bi_for_unit(unit_id, max_cycle, params, dataset_name):
-    """Generate complete BI data for a single engine unit."""
-    cycles = np.arange(1, max_cycle + 1)
-
-    n_periods_10 = len(range(0, max_cycle, 10))
-    n_periods_25 = len(range(0, max_cycle, 25))
-    n_periods_50 = len(range(0, max_cycle, 50))
-
-    # --- Per-unit criticality (fixed for engine's entire life) ---
-    # Represents the engine's role: test stand, revenue flight, military, etc.
-    unit_criticality = np.random.uniform(0, 1)
-
-    # --- Generate context variables FIRST (others depend on them) ---
-    shift_raw = generate_shift_pattern(n_periods_10)
-    contract_raw = generate_contract_penalty(n_periods_25)
-
-    # Production priority: depends on unit criticality (fixed) + stochastic
-    priority_raw = generate_production_priority(n_periods_10, unit_criticality)
-
-    # Expand contract to Δ=10 resolution so downtime_penalty can use it
-    contract_at_10 = np.array([
-        contract_raw[min(i * 10 // 25, len(contract_raw) - 1)]
-        for i in range(n_periods_10)
+def gen_maintenance_window(n_periods):
+    return np.array([
+        1 if i % 3 == 0 else np.random.choice([0, 1], p=[0.85, 0.15])
+        for i in range(n_periods)
     ])
 
-    # Downtime penalty: depends on priority, shift, contract — NOT degradation
-    downtime_raw = generate_downtime_penalty(
-        n_periods_10, params, priority_raw, shift_raw, contract_at_10
-    )
 
-    # --- Cost structure (independent, from ERP) ---
-    pm_cost_raw = generate_pm_cost(n_periods_50, params)
-    cm_cost_raw = generate_cm_cost(n_periods_50, params)
-    labor_std_raw = np.full(n_periods_50, params['labor_std']) + np.random.normal(0, 3, n_periods_50)
-    labor_ot_raw = np.full(n_periods_50, params['labor_ot']) + np.random.normal(0, 5, n_periods_50)
-
-    # --- Other context variables ---
-    revenue_raw = generate_revenue_per_hour(n_periods_25, params)
-    parts_avail_raw = generate_spare_parts(n_periods_25)
-    lead_time_raw = generate_lead_time(n_periods_25, parts_avail_raw)
-    tech_avail_raw = generate_technician_availability(n_periods_25)
-    maint_window_raw = generate_maintenance_window(n_periods_10)
-
-    # Expand to per-cycle using Eq. 4
-    data = {
-        'unit_id': np.full(max_cycle, unit_id, dtype=int),
-        'cycle': cycles,
-        'pm_cost': expand_bi_to_cycles(pm_cost_raw, 50, max_cycle),
-        'cm_cost': expand_bi_to_cycles(cm_cost_raw, 50, max_cycle),
-        'labor_rate_standard': expand_bi_to_cycles(labor_std_raw.round(2), 50, max_cycle),
-        'labor_rate_overtime': expand_bi_to_cycles(labor_ot_raw.round(2), 50, max_cycle),
-        'production_priority': expand_bi_to_cycles(priority_raw, 10, max_cycle),
-        'downtime_penalty': expand_bi_to_cycles(downtime_raw, 10, max_cycle),
-        'revenue_per_hour': expand_bi_to_cycles(revenue_raw, 25, max_cycle),
-        'spare_parts_available': expand_bi_to_cycles(parts_avail_raw, 25, max_cycle),
-        'spare_parts_lead_time': expand_bi_to_cycles(lead_time_raw, 25, max_cycle),
-        'technician_available': expand_bi_to_cycles(tech_avail_raw, 25, max_cycle),
-        'maintenance_window': expand_bi_to_cycles(maint_window_raw, 10, max_cycle),
-        'shift_pattern': expand_bi_to_cycles(shift_raw, 10, max_cycle),
-        'contract_penalty_active': expand_bi_to_cycles(contract_raw, 25, max_cycle),
-    }
-
-    return pd.DataFrame(data)
+def gen_shift_pattern(n_periods):
+    return np.array([i % 3 for i in range(n_periods)])
 
 
-def generate_dataset_bi(dataset_name):
-    """Generate BI data for an entire C-MAPSS sub-dataset."""
-    specs = CMAPSS_SPECS[dataset_name]
+# ============================================================================
+# Generate BI for one unit
+# ============================================================================
+
+def generate_unit_bi(unit_id, n_cycles, params):
+    """Generate all BI variables for one unit over its OBSERVED cycles."""
+    n10 = len(range(0, n_cycles, 10))
+    n25 = len(range(0, n_cycles, 25))
+    n50 = len(range(0, n_cycles, 50))
+
+    # Per-unit context drawn once (fleet role, seasonal phase)
+    criticality = np.random.uniform(0, 1)
+    revenue_phase = np.random.uniform(0, 2 * np.pi)
+
+    # Cost structure (Delta=50)
+    pm = gen_pm_cost(n50, params)
+    cm = gen_cm_cost(n50, params)
+    labor_std = gen_labor(n50, params['labor_std'], 3)
+    labor_ot = gen_labor(n50, params['labor_ot'], 5)
+
+    # Resources & contracts (Delta=25)
+    parts = gen_spare_parts(n25)
+    lead = gen_lead_time(parts)
+    tech = gen_technician(n25)
+    contract = gen_contract_penalty(n25)
+    revenue = gen_revenue(n25, params, revenue_phase)
+
+    # Production context (Delta=10)
+    shift = gen_shift_pattern(n10)
+    window = gen_maintenance_window(n10)
+    priority = gen_production_priority(n10, criticality)
+    contract_10 = resample_to_delta(contract, 25, 10, n10)
+    downtime = gen_downtime_penalty(n10, params, priority, shift, contract_10)
+
+    return pd.DataFrame({
+        'unit_id': np.full(n_cycles, unit_id, dtype=int),
+        'cycle': np.arange(1, n_cycles + 1),
+        'pm_cost': expand_to_cycles(pm, 50, n_cycles),
+        'cm_cost': expand_to_cycles(cm, 50, n_cycles),
+        'labor_rate_standard': expand_to_cycles(labor_std, 50, n_cycles),
+        'labor_rate_overtime': expand_to_cycles(labor_ot, 50, n_cycles),
+        'production_priority': expand_to_cycles(priority, 10, n_cycles).astype(int),
+        'downtime_penalty': expand_to_cycles(downtime, 10, n_cycles),
+        'revenue_per_hour': expand_to_cycles(revenue, 25, n_cycles),
+        'spare_parts_available': expand_to_cycles(parts, 25, n_cycles).astype(int),
+        'spare_parts_lead_time': expand_to_cycles(lead, 25, n_cycles).astype(int),
+        'technician_available': expand_to_cycles(tech, 25, n_cycles).astype(int),
+        'maintenance_window': expand_to_cycles(window, 10, n_cycles).astype(int),
+        'shift_pattern': expand_to_cycles(shift, 10, n_cycles).astype(int),
+        'contract_penalty_active': expand_to_cycles(contract, 25, n_cycles).astype(int),
+    })
+
+
+# ============================================================================
+# Leakage self-check
+# ============================================================================
+
+def leakage_check(train_bi):
+    """Print within-unit Spearman correlation of each continuous BI var with RUL."""
+    df = train_bi.copy()
+    df['RUL'] = df.groupby('unit_id')['cycle'].transform('max') - df['cycle']
+    print("  Within-unit Spearman rho with RUL (mean over units):")
+    for col in ['downtime_penalty', 'production_priority', 'cm_cost',
+                'pm_cost', 'revenue_per_hour']:
+        rhos = df.groupby('unit_id').apply(
+            lambda g: g[col].corr(g['RUL'], method='spearman'))
+        print(f"    {col:22s} {rhos.mean():+.3f}")
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def generate_dataset(dataset_name, cmapss_dir, output_dir):
+    """Generate BI data for one C-MAPSS dataset using real observed lengths."""
+    print(f"\n{'='*50}")
+    print(f"Generating BI data for {dataset_name}")
+    print(f"{'='*50}")
+
     params = COST_PARAMS[dataset_name]
-    lifetimes = generate_unit_lifetime(specs)
+    train_lengths, test_lengths = read_cmapss_lengths(cmapss_dir, dataset_name)
 
-    all_units = []
-    for unit_idx in range(specs['n_train_units']):
-        unit_id = unit_idx + 1
-        max_cycle = lifetimes[unit_idx]
-        unit_df = generate_bi_for_unit(unit_id, max_cycle, params, dataset_name)
-        all_units.append(unit_df)
+    train_bi = pd.concat(
+        [generate_unit_bi(u, n, params) for u, n in train_lengths.items()],
+        ignore_index=True)
+    train_path = output_dir / f"BI_{dataset_name}_train.csv"
+    train_bi.to_csv(train_path, index=False)
+    print(f"  Train BI: {train_path.name} — {train_bi.shape}")
 
-    df = pd.concat(all_units, ignore_index=True)
+    if test_lengths:
+        test_bi = pd.concat(
+            [generate_unit_bi(u, n, params) for u, n in test_lengths.items()],
+            ignore_index=True)
+        test_path = output_dir / f"BI_{dataset_name}_test.csv"
+        test_bi.to_csv(test_path, index=False)
+        print(f"  Test BI:  {test_path.name} — {test_bi.shape}")
 
-    # Cast integer columns
-    int_cols = ['unit_id', 'cycle', 'production_priority', 'spare_parts_available',
-                'spare_parts_lead_time', 'technician_available', 'maintenance_window',
-                'shift_pattern', 'contract_penalty_active']
-    for col in int_cols:
-        df[col] = df[col].astype(int)
-
-    return df
+    print(f"  PM={train_bi['pm_cost'].mean():.0f}, CM={train_bi['cm_cost'].mean():.0f}, "
+          f"Ratio={train_bi['cm_cost'].mean()/train_bi['pm_cost'].mean():.1f}x")
+    leakage_check(train_bi)
 
 
-# ===========================================================================
-# Main Generation
-# ===========================================================================
 if __name__ == '__main__':
-    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
-    os.makedirs(output_dir, exist_ok=True)
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent  # script lives in src/
 
-    for ds_name in ['FD001', 'FD002', 'FD003', 'FD004']:
-        print(f"Generating BI data for {ds_name}...")
-        df = generate_dataset_bi(ds_name)
-        filepath = os.path.join(output_dir, f'BI_{ds_name}.csv')
-        df.to_csv(filepath, index=False)
-        print(f"  -> {filepath}: {len(df)} rows, {df['unit_id'].nunique()} units")
-        print(f"     Columns: {list(df.columns)}")
-        print(f"     Sample costs: PM={df['pm_cost'].mean():.0f}, CM={df['cm_cost'].mean():.0f}, "
-              f"Ratio={df['cm_cost'].mean()/df['pm_cost'].mean():.1f}x")
+    cmapss_candidates = [
+        project_root / 'data' / 'raw_data' / 'C_MAPSS',
+        project_root / 'data' / 'raw' / 'C_MAPSS',
+        project_root / 'data' / 'C_MAPSS',
+        Path('data') / 'raw_data' / 'C_MAPSS',
+        Path('data') / 'raw' / 'C_MAPSS',
+        Path('data') / 'C_MAPSS',
+    ]
+    cmapss_dir = next((c for c in cmapss_candidates
+                       if (c / 'train_FD001.txt').exists()), None)
+    if cmapss_dir is None:
+        print("ERROR: Could not find C-MAPSS train files. Searched in:")
+        for c in cmapss_candidates:
+            print(f"  {c.resolve()}")
+        sys.exit(1)
+    print(f"C-MAPSS directory: {cmapss_dir.resolve()}")
 
-        # Quick leakage check: correlation with cycle (proxy for RUL)
-        corr = df['downtime_penalty'].corr(df['cycle'])
-        print(f"     downtime_penalty ↔ cycle correlation: {corr:.4f}")
-        print()
+    output_dir = project_root / 'data' / 'raw_data' / 'BI_data'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir.resolve()}")
 
-    print("All datasets generated successfully.")
+    for ds in ['FD001', 'FD002', 'FD003', 'FD004']:
+        try:
+            generate_dataset(ds, cmapss_dir, output_dir)
+        except FileNotFoundError as e:
+            print(f"  Skipping {ds}: {e}")
+
+    print("\n✓ Done.")
