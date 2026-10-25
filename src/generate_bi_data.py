@@ -389,6 +389,42 @@ def generate_dataset(dataset_name, cmapss_dir, output_dir):
     leakage_check(train_bi)
 
 
+UNIT_OFFSET = {'FD001': 0, 'FD002': 2000, 'FD003': 1000, 'FD004': 3000}  # same as generate_bi_asset_data
+COMBINED_SEED = 2031
+
+
+def generate_combined_fleet(cmapss_dir, output_dir, datasets, profile='FD001'):
+    """
+    Operational BI (training engines) for several C-MAPSS subsets treated as ONE fleet
+    run by one operator: every engine uses the same cost profile. With per-subset
+    profiles, cost levels would identify the subset, and the subsets differ in
+    lifetime (FD003 engines live longer), which would be an indirect lifetime signal.
+
+    Engines of the first subset keep the rows of BI_<first>_train.csv; the other
+    engines are generated with their own seed. Unit ids are offset (UNIT_OFFSET).
+    Output: BI_<D1>_<D2>_train.csv
+    """
+    tag = '_'.join(datasets)
+    print(f"\n{'='*50}\nGenerating combined fleet {tag} (profile {profile})\n{'='*50}")
+    params = COST_PARAMS[profile]
+    cols = ['unit', 'cycle'] + [f'op_{i}' for i in range(1, 4)] + [f's_{i}' for i in range(1, 22)]
+    parts = [pd.read_csv(output_dir / f"BI_{datasets[0]}_train.csv")]
+    parts[0]['unit_id'] += UNIT_OFFSET[datasets[0]]
+    state = np.random.get_state()
+    np.random.seed(COMBINED_SEED)
+    for ds in datasets[1:]:
+        df = pd.read_csv(cmapss_dir / f"train_{ds}.txt", sep=r'\s+', header=None, names=cols, engine='python')
+        lengths = df.groupby('unit')['cycle'].max()
+        parts.append(pd.concat([generate_unit_bi(u + UNIT_OFFSET[ds], n, params) for u, n in lengths.items()],
+                               ignore_index=True))
+    np.random.set_state(state)
+    fleet = pd.concat(parts, ignore_index=True)
+    path = output_dir / f"BI_{tag}_train.csv"
+    fleet.to_csv(path, index=False)
+    print(f"  Train BI: {path.name} — {fleet.shape}, {fleet['unit_id'].nunique()} engines")
+    leakage_check(fleet)
+
+
 if __name__ == '__main__':
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent  # script lives in src/
@@ -419,5 +455,8 @@ if __name__ == '__main__':
             generate_dataset(ds, cmapss_dir, output_dir)
         except FileNotFoundError as e:
             print(f"  Skipping {ds}: {e}")
+
+    if (cmapss_dir / 'train_FD003.txt').exists():
+        generate_combined_fleet(cmapss_dir, output_dir, ['FD001', 'FD003'])
 
     print("\n✓ Done.")

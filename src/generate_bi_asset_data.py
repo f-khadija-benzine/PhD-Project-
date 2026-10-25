@@ -51,6 +51,8 @@ Output (does not touch existing BI files)
 -----------------------------------------
     data/raw_data/BI_data/asset/BI_FD001_asset_rho{00,02,04,06}.csv
     data/raw_data/BI_data/asset/BI_FD001_asset_audit.csv
+    and, if train_FD003.txt is present, the combined fleet (FD003 engine ids + 1000):
+    data/raw_data/BI_data/asset/BI_FD001_FD003_asset_rho{00,02,04,06}.csv
 
 Run from the project root:
     python src/generate_bi_asset_data.py
@@ -80,6 +82,27 @@ ASSET_CONTINUOUS = ['prior_unplanned_removals', 'hours_since_overhaul_entry']
 
 def rho_tag(rho: float) -> str:
     return f"rho{int(round(rho * 10)):02d}"
+
+
+# Engine identifiers are offset per sub-dataset when fleets are combined, so they stay unique
+UNIT_OFFSET = {'FD001': 0, 'FD002': 2000, 'FD003': 1000, 'FD004': 3000}
+
+
+def fleet_tag(datasets) -> str:
+    """'FD001' for one sub-dataset, 'FD001_FD003' for a combined fleet."""
+    return datasets if isinstance(datasets, str) else '_'.join(datasets)
+
+
+def read_fleet_lifetimes(cmapss_dir: Path, datasets) -> pd.Series:
+    """Total life per training engine for one or several sub-datasets (identifiers offset)."""
+    if isinstance(datasets, str):
+        return read_train_lifetimes(cmapss_dir, datasets)
+    parts = []
+    for ds in datasets:
+        life = read_train_lifetimes(cmapss_dir, ds)
+        life.index = life.index + UNIT_OFFSET[ds]
+        parts.append(life)
+    return pd.concat(parts).sort_index()
 
 
 def read_train_lifetimes(cmapss_dir: Path, dataset_name: str = 'FD001') -> pd.Series:
@@ -156,11 +179,14 @@ def generate_asset_block(lifetimes: pd.Series, rho: float, noise: dict) -> pd.Da
     }), r
 
 
-def generate_all(cmapss_dir: Path, output_dir: Path, dataset_name: str = 'FD001',
+def generate_all(cmapss_dir: Path, output_dir: Path, dataset_name='FD001',
                  seed: int = SEED, rho_levels=RHO_LEVELS) -> dict:
-    """Write one asset file per rho plus an audit file. Returns {rho: DataFrame}."""
+    """Write one asset file per rho plus an audit file. Returns {rho: DataFrame}.
+    dataset_name: one sub-dataset ('FD001') or a list for a combined fleet (['FD001', 'FD003']);
+    the association with life is defined over the whole fleet."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    lifetimes = read_train_lifetimes(cmapss_dir, dataset_name)
+    lifetimes = read_fleet_lifetimes(cmapss_dir, dataset_name)
+    dataset_name = fleet_tag(dataset_name)
     rng = np.random.default_rng(seed)
     noise = draw_common_noise(len(lifetimes), rng)
 
@@ -192,5 +218,8 @@ if __name__ == '__main__':
         sys.exit(1)
     output_dir = project_root / 'data' / 'raw_data' / 'BI_data' / 'asset'
     print(f"C-MAPSS: {cmapss_dir.resolve()}\nOutput:  {output_dir.resolve()}")
-    generate_all(cmapss_dir, output_dir)
+    generate_all(cmapss_dir, output_dir, 'FD001')
+    if (cmapss_dir / 'train_FD003.txt').exists():
+        print("FD003 found: generating the combined FD001 + FD003 fleet")
+        generate_all(cmapss_dir, output_dir, ['FD001', 'FD003'])
     print("✓ Done.")
