@@ -252,6 +252,45 @@ def build_dual_attention_bilstm(
     return model, attention_model
 
 
+def build_bilstm_ablation(
+    window_size: int = 30,
+    n_features: int = 32,
+    lstm_units: int = 64,
+    feature_attention_dim: int = 32,
+    temporal_attention_dim: int = 64,
+    dropout_rate: float = 0.3,
+    dense_units: int = 32,
+    learning_rate: float = 0.001,
+    feature_attention: bool = True,
+    temporal_attention: bool = True,
+) -> Model:
+    """
+    BiLSTM for the attention ablation study. Same layers and hyperparameters as
+    build_dual_attention_bilstm; each attention mechanism can be switched off:
+      - feature_attention=False: inputs go to the BiLSTM unweighted;
+      - temporal_attention=False: the context vector is the mean of the BiLSTM
+        outputs over the window (GlobalAveragePooling1D) instead of the
+        attention-weighted sum.
+    With both True the model is identical to build_dual_attention_bilstm.
+    """
+    inputs = layers.Input(shape=(window_size, n_features), name='input')
+    x = inputs
+    if feature_attention:
+        x, _ = FeatureAttention(hidden_dim=feature_attention_dim, name='feature_attention')(x, return_weights=True)
+    x = layers.Bidirectional(layers.LSTM(lstm_units, return_sequences=True), name='bilstm')(x)
+    x = layers.Dropout(dropout_rate, name='dropout_lstm')(x)
+    if temporal_attention:
+        context, _ = TemporalAttention(attention_dim=temporal_attention_dim, name='temporal_attention')(x, return_weights=True)
+    else:
+        context = layers.GlobalAveragePooling1D(name='mean_pooling')(x)
+    x = layers.Dense(dense_units, activation='relu', name='dense_1')(context)
+    x = layers.Dropout(dropout_rate, name='dropout_dense')(x)
+    output = layers.Dense(1, activation='linear', name='rul_output')(x)
+    model = Model(inputs=inputs, outputs=output, name='BiLSTM_ablation')
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate), loss='mse', metrics=['mae'])
+    return model
+
+
 # ==============================================================================
 # Attention Weight Extraction & Storage (for Recommendation System)
 # ==============================================================================
